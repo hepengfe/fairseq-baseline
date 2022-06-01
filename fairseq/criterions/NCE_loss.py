@@ -21,17 +21,37 @@ class NCECriterionConfig(FairseqDataclass):
 def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
              org_targets = None,
              version = 2):
+    """_summary_
+
+    Args:
+        targets (_type_): _description_
+        neg_targets (_type_): _description_
+        logits (_type_): current logits is (bs, k_neg, max_seq_len)
+            we need to make it simple as (bs, max_seq_len)
+            also, we want to offload some tensors from gpu that are for stats.
+        ignore_index (_type_, optional): _description_. Defaults to None.
+        reduce (bool, optional): _description_. Defaults to True.
+        org_targets (_type_, optional): _description_. Defaults to None.
+        version (int, optional): _description_. Defaults to 2.
+
+    Returns:
+        _type_: _description_
+    """
     # if target.dim() == lprobs.dim() - 1:
     #     target = target.unsqueeze(-1)
 
     if org_targets is None:
         org_targets = targets
-
-    
-    x1 = logits.gather(dim=-1, index=torch.unsqueeze(targets, -1))
-    x2 = logits.gather(dim=-1, index=torch.unsqueeze(neg_targets, -1))
+    if version == 1:
+        k_neg = 1
+    elif version == 2:
+        k_neg = neg_targets.shape[1]
     # import pdb; pdb.set_trace()
-    # print('check gather')
+    # print('how to gather logits')
+    
+    # logits.gather(dim=-1,index=torch.unsqueeze(targets[:,0 , :], -1))
+    x1 = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(targets[:,neg_i, :], -1)).squeeze()  for neg_i in range(k_neg)], dim = 1)
+    x2 = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze()  for neg_i in range(k_neg)], dim = 1)
     if version == 1:
         loss = -torch.log(1/(1 + torch.exp(x2-x1)))
     else:
@@ -39,7 +59,9 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
         loss = -torch.log(1/(1 + mu.sum(dim=1, keepdim=True)))
         loss = loss.squeeze(1) # squeeze k_neg dimension
 
-
+    # import pdb; pdb.set_trace()
+    # print('check x1 targets ')
+    
     if ignore_index is not None:
         # original targets are used to compute mask
         pad_mask = org_targets.eq(ignore_index)
@@ -48,6 +70,10 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
     else:
         loss = loss.squeeze(-1)
 
+    num_correct_classification = torch.sum( torch.all((x1 > x2), dim=1).masked_fill_(pad_mask, False))
+    num_tokens = torch.numel(org_targets) - torch.sum(pad_mask) # exclude padding
+
+    print("prediction acc: " (num_correct_classification/num_tokens).item(), "loss: ", loss)
     if reduce:
         # loss = loss.mean(dim=1)
         loss = loss.sum()
@@ -101,7 +127,7 @@ def batch_sampling_v2(target_batch, vocab_size, k_neg=1, validate_sampling=True)
     for tgt_seq in target_batch:
         tgt_seq, neg_seq = seq_sampling(tgt_seq, vocab_size, k_neg, validate_sampling=True)
         # tgt_seq shape: (k_neg, max_seq_len)
-        new_target_batch.append(tgt_seq)
+        new_target_batch.append(tgt_seq) # NOTE: tho it can be optimized, as they are just single indices and k_neg won't be too large. The memory complexity is just O(k_neg * targets numel size * 1) = O(1).
         neg_target_batch.append(neg_seq)
     # new_target_batch shape: (batch_size * k_neg, max_seq_len)
 
@@ -178,12 +204,14 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 logits = logits,
                 ignore_index=self.padding_idx,
                 reduce=reduce,
+                version = version
             )
+
         elif version == 2:
-            k_neg = 3
+            k_neg = 10000
             dup_targets, neg_targets = batch_sampling_v2(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
 
-            logits = logits.unsqueeze(1).repeat_interleave(k_neg, dim=1)
+            # logits = logits.unsqueeze(1).repeat_interleave(k_neg, dim=1) # TODO: it takes much more memory as k_neg grows 
             # logits = logits.repeat_interleave(k_neg, dim=0)
             
 
@@ -193,10 +221,13 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 logits = logits,
                 ignore_index=self.padding_idx,
                 reduce=reduce,
-                org_targets = targets
+                org_targets = targets,
+                version = version
             )
-        # lprobs = model.get_normalized_probs(net_output, log_probs=True)
-        # lprobs = lprobs.view(-1, lprobs.size(-1))
+        lprobs = model.get_normalized_probs(net_output, log_probs=True)
+        lprobs = lprobs.view(-1, lprobs.size(-1))
+
+        
         # target = model.get_targets(sample, net_output).view(-1)
         # loss = F.nll_loss(
         #     lprobs,
