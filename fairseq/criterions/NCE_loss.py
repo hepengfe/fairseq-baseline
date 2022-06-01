@@ -73,8 +73,9 @@ def seq_sampling(target_seq, vocab_size, k_neg = 1, validate_sampling=True):
         1/(vocab_size - num_diff_tokens)
     )
     pos_token_indices = torch.tensor(flattened_targets.tolist())
+
     # first dimension, positive token indices, zero weights
-    weights.index_fill(0, pos_token_indices, 0) 
+    weights = weights.index_fill(0, pos_token_indices, 0)
     device = target_seq.device
     max_seq_len = len(target_seq)
     sampled_neg_targets = torch.multinomial(weights, k_neg* max_seq_len, replacement=True).reshape((k_neg, max_seq_len)).to(device)
@@ -181,8 +182,7 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         elif version == 2:
             k_neg = 3
             dup_targets, neg_targets = batch_sampling_v2(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
-            
-            print('repeat interleave along a new dimension')
+
             logits = logits.unsqueeze(1).repeat_interleave(k_neg, dim=1)
             # logits = logits.repeat_interleave(k_neg, dim=0)
             
