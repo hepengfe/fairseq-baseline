@@ -19,7 +19,7 @@ We provide reference implementations of various sequence modeling papers:
 
 <details><summary>List of implemented papers</summary><p>
 
-* **Convolutional Neural Networks (CNN)**
+* **Convolutional Neural Networks (CNN)** 
   + [Language Modeling with Gated Convolutional Networks (Dauphin et al., 2017)](examples/language_model/conv_lm/README.md)
   + [Convolutional Sequence to Sequence Learning (Gehring et al., 2017)](examples/conv_seq2seq/README.md)
   + [Classical Structured Prediction Losses for Sequence to Sequence Learning (Edunov et al., 2018)](https://github.com/pytorch/fairseq/tree/classic_seqlevel)
@@ -27,7 +27,7 @@ We provide reference implementations of various sequence modeling papers:
   + [wav2vec: Unsupervised Pre-training for Speech Recognition (Schneider et al., 2019)](examples/wav2vec/README.md)
 * **LightConv and DynamicConv models**
   + [Pay Less Attention with Lightweight and Dynamic Convolutions (Wu et al., 2019)](examples/pay_less_attention_paper/README.md)
-* **Long Short-Term Memory (LSTM) networks**
+* **Long Short-Term Memory (LSTM) networks** 
   + Effective Approaches to Attention-based Neural Machine Translation (Luong et al., 2015)
 * **Transformer (self-attention) networks**
   + Attention Is All You Need (Vaswani et al., 2017)

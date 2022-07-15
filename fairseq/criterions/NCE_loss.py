@@ -18,20 +18,52 @@ class NCECriterionConfig(FairseqDataclass):
     sentence_avg: bool = II("optimization.sentence_avg")
 
 
+def validate_samples(neg_targets, target_batch):
+    """
+    neg_targets    bs x (k_neg) x seq_len
+    target_batch   bs x seq_len
+    k_neg_dim: whether k_neg dimension is in neg_targets
+    """
+    is_k_neg_dim = len(neg_targets.shape) == 3
+    if is_k_neg_dim:
+        k_neg = neg_targets.shape[1]
+        for k in range(k_neg):
+            assert torch.any(neg_targets[:, k, :] == target_batch.unsqueeze(1)) == False,\
+                "all sampled negative targets must be different from positive targets"
+    else:
+        assert torch.any(neg_targets == target_batch) == False,\
+                "all sampled negative targets must be different from positive targets"
+
+def mask(loss, pad_mask):
+    """
+    loss    bs x (k_neg) x seq_len
+    pad_mask   bs x seq_len
+    k_neg_dim: whether k_neg dimension is in neg_targets
+    """
+    is_k_neg_dim = len(loss.shape) == 3
+    if is_k_neg_dim:
+        k_neg = loss.shape[1]
+        for k in range(k_neg):
+            loss[:, k, :].masked_fill_(pad_mask, 0.0)
+    else:
+        loss.masked_fill_(pad_mask, 0.0)
+    return loss
+    
+
 def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
              org_targets = None,
              version = 2):
     """_summary_
 
     Args:
-        targets (_type_): _description_
-        neg_targets (_type_): _description_
+        targets (_type_): (bs, neg_dim, seq_len)
+        neg_targets (_type_): (bs, neg_dim, seq_len)
         logits (_type_): current logits is (bs, k_neg, max_seq_len)
             we need to make it simple as (bs, max_seq_len)
             also, we want to offload some tensors from gpu that are for stats.
         ignore_index (_type_, optional): _description_. Defaults to None.
         reduce (bool, optional): _description_. Defaults to True.
-        org_targets (_type_, optional): _description_. Defaults to None.
+        org_targets (_type_, optional): original targets from dataset. It preserves the batch size. shape: bs  x seq_len
         version (int, optional): _description_. Defaults to 2.
 
     Returns:
@@ -44,39 +76,135 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
         org_targets = targets
     if version == 1:
         k_neg = 1
-    elif version == 2:
-        k_neg = neg_targets.shape[1]
-    # import pdb; pdb.set_trace()
-    # print('how to gather logits')
-    
-    # logits.gather(dim=-1,index=torch.unsqueeze(targets[:,0 , :], -1))
-    x1 = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(targets[:,neg_i, :], -1)).squeeze()  for neg_i in range(k_neg)], dim = 1)
-    x2 = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze()  for neg_i in range(k_neg)], dim = 1)
-    if version == 1:
-        loss = -torch.log(1/(1 + torch.exp(x2-x1)))
     else:
-        mu = torch.exp(x2-x1)
-        loss = -torch.log(1/(1 + mu.sum(dim=1, keepdim=True)))
-        loss = loss.squeeze(1) # squeeze k_neg dimension
+        k_neg = neg_targets.shape[1]
 
-    # import pdb; pdb.set_trace()
-    # print('check x1 targets ')
+    def loss_v1(targets, neg_targets):
+        """
+        pos_logits and neg_logits have the same shape.
+        Assume pos_logits are duplicated in advance
+
+        compute the loss based on all logits diff
+
+        Args:
+            pos_logits (_type_): bs x k_neg x seq_len
+            neg_logits (_type_): bs x k_neg x seq_len
+        """
+        assert targets.shape[1] > 1, "loss version requries duplicate targets"
+        pos_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
+        neg_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
+        loss = -torch.log(1/(1 + torch.exp(neg_logits-pos_logits))) # negative sampling
+        return loss
+    
+    def loss_v2(targets, neg_targets):
+        """
+        pos logits's k_neg = 1, and neg_logits k_neg > 1
+        
+        maximize the positive logits 
+        Note: the computation results is diff from loss_v3
+
+        Args:
+            pos_logits: bs x seq_len
+            neg_logits: bs x k_neg x seq_len
+        """
+        pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)).squeeze(-1) 
+        # pos_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
+        # neg_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
+        mu = []
+        max_neg_logits = []
+        
+        for neg_i in range(k_neg):
+            neg_logits_i = logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  # bs x seq_len
+            mu.append(torch.exp(neg_logits_i-pos_logits))
+            max_neg_logits.append(neg_logits_i)
+        max_neg_logits = torch.stack(max_neg_logits, dim = 1)
+        max_neg_logits = torch.max(max_neg_logits, dim =1).values # hardest 
+        
+        mu = torch.stack(mu, dim = 1) # bs x k_neg x seq_len 
+        # mu = torch.exp(neg_logits-pos_logits)
+        loss = -torch.log(1/(1 + mu.sum(dim=1, keepdim=True))) # 1 - 1/(1 + sum(e^{neg_i-pos}))
+        loss = loss.squeeze(1) # squeeze k_neg dimension
+        return loss
+
+    def loss_v3(targets, neg_targets):
+        """
+        pos logits's k_neg = 1, and neg_logits k_neg > 1
+
+        compute the loss based on all logits diff -> maximize the whole batch's
+        probability?
+
+        Args:
+            pos_logits (_type_): bs x seq_len
+            neg_logits (_type_): bs x k_neg x seq_len
+        """
+        pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)).squeeze(-1) 
+        logits_diff = []
+        max_neg_logits = []
+        
+        for neg_i in range(k_neg):
+            neg_logits_i = logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  # bs x seq_len
+            logits_diff.append(neg_logits_i-pos_logits)
+            max_neg_logits.append(neg_logits_i)
+        max_neg_logits = torch.stack(max_neg_logits, dim = 1)
+        max_neg_logits = torch.max(max_neg_logits, dim =1).values # hardest 
+        
+        logits_diff = torch.stack(logits_diff, dim = 1) # bs x k_neg x seq_len 
+        loss = -torch.log(1/(1 + torch.exp(logits_diff)))
+        loss = loss.squeeze(1) # squeeze k_neg dimension
+        return loss
+
+    def loss_v4(targets, neg_targets, logits):
+        """
+        bce loss
+        """
+        
+        pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)).squeeze(-1) 
+        neg_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
+        # concatenate pos logits and neg logits
+        logits = torch.cat([pos_logits.unsqueeze(1), neg_logits], dim = 1)
+        
+        label = torch.zeros_like(logits)
+        label[:, 0, :] = 1 # only the first item is the positive logits
+        criterion = torch.nn.BCEWithLogitsLoss(reduction='none')
+        # logit_true = pos_logits - neg_logits
+        loss = criterion(logits, label)# .sum(dim=2)
+        return loss
+    # loss types
+    # loss = loss_v1(targets, neg_targets)
+    loss = loss_v2(org_targets, neg_targets)
+    # loss = loss_v3(org_targets, neg_targets)
+    # loss = loss_v4(org_targets, neg_targets, logits)
     
     if ignore_index is not None:
         # original targets are used to compute mask
         pad_mask = org_targets.eq(ignore_index)
         loss = loss.squeeze(-1)
-        loss.masked_fill_(pad_mask, 0.0)
+        pad_mask = pad_mask.squeeze(-1)
+        # RuntimeError: expand(CUDABoolType{[1, 457]}, size=[457]): the number of sizes provided (1) must be greater or equal to the number of dimensions in the tensor (2)
+        loss = mask(loss, pad_mask)
     else:
         loss = loss.squeeze(-1)
-
-    num_correct_classification = torch.sum( torch.all((x1 > x2), dim=1).masked_fill_(pad_mask, False))
-    num_tokens = torch.numel(org_targets) - torch.sum(pad_mask) # exclude padding
-
-    print("prediction acc: " (num_correct_classification/num_tokens).item(), "loss: ", loss)
+        
+    
+    
+    
+    
     if reduce:
-        # loss = loss.mean(dim=1)
+        # loss = loss.sum()
         loss = loss.sum()
+    
+    check_classification_acc = False
+    if check_classification_acc:
+        if version == 1:
+            num_correct_classification = torch.sum((pos_logits > max_neg_logits).masked_fill_(pad_mask, False))
+            num_tokens = torch.numel(org_targets) - torch.sum(pad_mask)
+        else:
+            num_correct_classification = torch.sum( (pos_logits > max_neg_logits).masked_fill_(pad_mask, False))
+            num_tokens = torch.numel(org_targets) - torch.sum(pad_mask) # exclude padding
+        # import pdb; pdb.set_trace()
+        # print(' check max_neg_logits')
+        # print(" prediction acc: ", (num_correct_classification/num_tokens).item(), "loss: ", loss.item())
+
     return loss
 
 def seq_sampling(target_seq, vocab_size, k_neg = 1, validate_sampling=True):
@@ -88,24 +216,29 @@ def seq_sampling(target_seq, vocab_size, k_neg = 1, validate_sampling=True):
     assert len(target_seq.shape) == 1, "must be a sequence"
     # TODO: get statistics from dataset rather than data batch
     # neg sample size:  num_neg_sample * bs_size * length
-    flattened_targets = torch.flatten(target_seq)
-    token_ids_set = set(flattened_targets.tolist())
-
+    flattened_targets_l = torch.flatten(target_seq).tolist()
+    
+    # pos_attack = set([ 2,  5,  4,  6,  7, 32, 22,  8, 13, 68, 55, 26, 11, 56, 81, 63, 36, 21,
+    #       9, 44]) # make them negative (remove from positive)
+    # flattened_targets_l += pos_attack
+    pos_token_ids_set = set(flattened_targets_l) 
+    # pos_token_ids_set = set(flattened_targets_l) - pos_attack
+    
     # get set all tokens ids and count the token ids
     # fill col of sample ids and excluding pos token ids
 
-    num_diff_tokens = len(token_ids_set)
+    num_diff_tokens = len(pos_token_ids_set)
     weights = torch.empty(vocab_size).fill_(
         1/(vocab_size - num_diff_tokens)
     )
-    pos_token_indices = torch.tensor(flattened_targets.tolist())
-
+    pos_token_indices = torch.tensor(list(pos_token_ids_set))
     # first dimension, positive token indices, zero weights
     weights = weights.index_fill(0, pos_token_indices, 0)
     device = target_seq.device
     max_seq_len = len(target_seq)
     sampled_neg_targets = torch.multinomial(weights, k_neg* max_seq_len, replacement=True).reshape((k_neg, max_seq_len)).to(device)
     
+    validate_sampling = True
     target_seq = target_seq.unsqueeze(0).repeat((k_neg,1))
     if validate_sampling:
         assert torch.any(sampled_neg_targets == target_seq) == False,\
@@ -117,15 +250,15 @@ def seq_sampling(target_seq, vocab_size, k_neg = 1, validate_sampling=True):
 
 def batch_sampling_v2(target_batch, vocab_size, k_neg=1, validate_sampling=True):
     """
-    sampling net targets for the whole tgt length
+    sampling net targets for the whole tgt length.  (seq_sampling)
     
     Return shape:
-        (batch_size * k_neg, max_seq_length)
+        (batch_size, k_neg, max_seq_length)
     """
     new_target_batch = []
     neg_target_batch = []
-    for tgt_seq in target_batch:
-        tgt_seq, neg_seq = seq_sampling(tgt_seq, vocab_size, k_neg, validate_sampling=True)
+    for tgt_seq in target_batch: # along bs dimension
+        tgt_seq, neg_seq = seq_sampling(tgt_seq, vocab_size, k_neg, validate_sampling=validate_sampling)
         # tgt_seq shape: (k_neg, max_seq_len)
         new_target_batch.append(tgt_seq) # NOTE: tho it can be optimized, as they are just single indices and k_neg won't be too large. The memory complexity is just O(k_neg * targets numel size * 1) = O(1).
         neg_target_batch.append(neg_seq)
@@ -144,12 +277,12 @@ def batch_sampling(target_batch, vocab_size, k_neg=1, validate_sampling=True):
     # TODO: get statistics from dataset rather than data batch
     # neg sample size:  num_neg_sample * bs_size * length
     flattened_targets = torch.flatten(target_batch)
-    token_ids_set = set(flattened_targets.tolist())
+    pos_token_ids_set = set(flattened_targets.tolist())
 
     # get set all tokens ids and count the token ids
     # fill col of sample ids and excluding pos token ids
 
-    num_diff_tokens = len(token_ids_set)
+    num_diff_tokens = len(pos_token_ids_set)
     weights = torch.empty(vocab_size).fill_(
         1/(vocab_size - num_diff_tokens)
     )
@@ -157,11 +290,86 @@ def batch_sampling(target_batch, vocab_size, k_neg=1, validate_sampling=True):
         weights[pos_token_id] = 0
     batch_device = target_batch.device
     bs, max_seq_len = target_batch.shape
-    sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=True).reshape(bs, k_neg* max_seq_len).to(batch_device)
+
+    sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=True).reshape(bs, k_neg, max_seq_len).to(batch_device)
+    # import pdb; pdb.set_trace()
+    # print('check sampling weights')
     if validate_sampling:
-        assert torch.any(sampled_neg_targets == target_batch) == False,\
-            "all sampled negative targets must be different from positive targets"
+        validate_samples(sampled_neg_targets, target_batch)
     return sampled_neg_targets
+
+def batch_sampling_v3(target_batch, vocab_size, k_neg=1, validate_sampling=True):
+    """
+    sampling net targets along the each seq length.
+
+    It's deprecated because this sampling will introduce neighbour tokens which
+    will want to make them dissimilar to the target tokens.
+    """
+    bs, seq_len = target_batch.shape
+    batch_device = target_batch.device
+    sampled_neg_targets = []
+
+    for j in range(seq_len):
+        flattened_targets = torch.flatten(target_batch[:,j])
+        pos_token_ids_set = set(flattened_targets.tolist())
+        num_diff_tokens = len(pos_token_ids_set)
+        weights = torch.empty(vocab_size).fill_(
+            1/(vocab_size - num_diff_tokens)
+        )
+        for pos_token_id in flattened_targets.tolist():
+            weights[pos_token_id] = 0
+        sampled_neg_targets_j = torch.multinomial(weights, bs*k_neg, replacement=True).reshape(bs, k_neg)
+        sampled_neg_targets.append(sampled_neg_targets_j)
+        
+    # import pdb; pdb.set_trace()
+    # print('stack neg targets')
+    # stack over seq len dimension
+    sampled_neg_targets = torch.stack(sampled_neg_targets, dim=2)
+    
+    # reshape: bs x k_neg x seq_len -> bs x (k_neg * seq_len)
+    # sampled_neg_targets = sampled_neg_targets.reshape(bs, k_neg,  seq_len).to(batch_device)
+    sampled_neg_targets = sampled_neg_targets.to(batch_device)
+    if validate_sampling:
+        validate_samples(sampled_neg_targets, target_batch)
+    return sampled_neg_targets
+
+
+def batch_sampling_v4(target_batch, vocab_size, k_neg=1, validate_sampling=True):
+    """
+    Sampling neg targets by add target batch by a ramdom matrix and mod vocab size.
+
+    It's deprecated because this sampling will introduce neighbour tokens which
+    will want to make them dissimilar to the target tokens.
+
+    Args:
+        target_batch (_type_): _description_
+        vocab_size (_type_): _description_
+        k_neg (int, optional): _description_. Defaults to 1.
+        validate_sampling (bool, optional): _description_. Defaults to True.
+
+    Returns:
+        _type_: _description_
+    """
+    batch_device = target_batch.device
+    bs, max_seq_len = target_batch.shape
+    def sample_random_tensor(l, h, shape):
+        return torch.randint(low=l, high=h, size=shape)
+    
+    sampled_neg_targets = []
+    for _ in range(k_neg):
+        rand_additive = sample_random_tensor(1, vocab_size-1, target_batch.shape).to(batch_device)
+        snt = torch.remainder((target_batch + rand_additive), vocab_size)
+        sampled_neg_targets.append(snt)
+        validate_samples(snt, target_batch)
+    sampled_neg_targets = torch.stack(sampled_neg_targets, dim=1)
+    # sampled_neg_targets = sampled_neg_targets.reshape(bs, k_neg* max_seq_len)
+    # sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=True).reshape(bs, k_neg* max_seq_len).to(batch_device)
+    # import pdb; pdb.set_trace()
+    # print('check sampling weights')
+    
+    return sampled_neg_targets
+
+
 
 @register_criterion("nce", dataclass=NCECriterionConfig)
 class NoiseContrastiveEstimationCriterion(FairseqCriterion):
@@ -190,32 +398,52 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         }
         return loss, sample_size, logging_output
 
+    def compute_ce_loss(self, model, net_output, sample, reduce=True):
+        model.eval()
+        with torch.no_grad():
+            lprobs = model.get_normalized_probs(net_output, log_probs=True)
+            lprobs = lprobs.view(-1, lprobs.size(-1))
+            target = model.get_targets(sample, net_output).view(-1)
+            loss = F.nll_loss(
+                lprobs,
+                target,
+                ignore_index=self.padding_idx,
+                reduction="sum" if reduce else "none",
+            )
+        compare_to_ce = False
+        if compare_to_ce:
+            print("CE Loss: ", loss)
+        model.train()
+        
+
+
     def compute_loss(self, model, net_output, sample, reduce=True):
         vocab_size = net_output[0].size(2)
         targets = sample['target']
-        version = 2
+        version = 1
         logits = net_output[0]
         bs, max_seq_len, vocab_size = logits.shape
+        k_neg = 30
         if version == 1:
-            neg_targets = batch_sampling(target_batch=targets, vocab_size=vocab_size, k_neg=1)
+            neg_targets = batch_sampling(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
+            # neg_targets = neg_targets.unsqueeze(0)
+            # targets = targets.unsqueeze(0)
             loss = nll_loss(
                 targets,
                 neg_targets,
                 logits = logits,
                 ignore_index=self.padding_idx,
                 reduce=reduce,
+                org_targets = targets,
                 version = version
             )
-
         elif version == 2:
-            k_neg = 10000
             dup_targets, neg_targets = batch_sampling_v2(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
 
             # logits = logits.unsqueeze(1).repeat_interleave(k_neg, dim=1) # TODO: it takes much more memory as k_neg grows 
             # logits = logits.repeat_interleave(k_neg, dim=0)
-            
-
             loss = nll_loss(
+                # dup_targets,
                 dup_targets,
                 neg_targets,
                 logits = logits,
@@ -224,8 +452,49 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 org_targets = targets,
                 version = version
             )
-        lprobs = model.get_normalized_probs(net_output, log_probs=True)
-        lprobs = lprobs.view(-1, lprobs.size(-1))
+            self.compute_ce_loss(model, net_output, sample, reduce=True)
+        elif version == 3:
+            neg_targets = batch_sampling_v3(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
+            # neg_targets = neg_targets.unsqueeze(0)
+            # targets = targets.unsqueeze(0)
+            loss = nll_loss(
+                targets,
+                neg_targets,
+                logits = logits,
+                ignore_index=self.padding_idx,
+                reduce=reduce,
+                org_targets = targets,
+                version = version
+            )
+        elif version == 4:
+            neg_targets = batch_sampling_v4(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
+            # neg_targets = neg_targets.unsqueeze(0)
+            # targets = targets.unsqueeze(0)
+            loss = nll_loss(
+                targets,
+                neg_targets,
+                logits = logits,
+                ignore_index=self.padding_idx,
+                reduce=reduce,
+                org_targets = targets,
+                version = version
+            )
+            
+        elif version == 5:
+            neg_targets = batch_sampling(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
+
+            loss = nll_loss(
+                targets,
+                neg_targets,
+                logits = logits,
+                ignore_index=self.padding_idx,
+                reduce=reduce,
+                org_targets = targets,
+                version = version
+            )
+
+        # lprobs = model.get_normalized_probs(net_output, log_probs=True)
+        # lprobs = lprobs.view(-1, lprobs.size(-1))
 
         
         # target = model.get_targets(sample, net_output).view(-1)

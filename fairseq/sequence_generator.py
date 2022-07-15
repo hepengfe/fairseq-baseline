@@ -344,6 +344,10 @@ class SequenceGenerator(nn.Module):
                     incremental_states,
                     self.temperature,
                 )
+            
+            # import pdb; pdb.set_trace()
+            # print('check logits')
+            
 
             if self.lm_model is not None:
                 lm_out = self.lm_model(tokens[:, : step + 1])
