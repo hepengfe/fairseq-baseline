@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+
 import math
 from dataclasses import dataclass
 
@@ -17,6 +18,20 @@ import torch
 class NCECriterionConfig(FairseqDataclass):
     sentence_avg: bool = II("optimization.sentence_avg")
 
+
+def compute_mu(logits, neg_targets, pos_logits, neg_i):
+    """
+    Compute mu for each negative sample in batch (bs x 1 x seq_len).
+
+
+    Note: the order doesn't matter as the loss will be summed up any way and the neg logits are randomly selected. 
+
+    Returns:
+        mu and its corresponding negative logits
+    """
+    neg_logits_i = logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  # bs x seq_len
+    mu_i = torch.exp(neg_logits_i-pos_logits)
+    return neg_logits_i, mu_i
 
 def validate_samples(neg_targets, target_batch):
     """
@@ -48,7 +63,7 @@ def mask(loss, pad_mask):
     else:
         loss.masked_fill_(pad_mask, 0.0)
     return loss
-    
+
 
 def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
              org_targets = None,
@@ -75,10 +90,13 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
 
     if org_targets is None:
         org_targets = targets
-    if sample_version == 1:
-        k_neg = 1
-    else:
-        k_neg = neg_targets.shape[1]
+    # if sample_version == 1:
+    #     k_neg = 1
+    # else:
+    #     k_neg = neg_targets.shape[1]
+    k_neg = neg_targets.shape[1]
+
+
 
     def loss_v1(targets, neg_targets):
         """
@@ -92,7 +110,9 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
             neg_targets (_type_): bs x k_neg x seq_len
         """
         assert targets.shape[1] > 1, "loss version requries duplicate targets"
-        pos_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
+        pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)) # bs x seq_len x 1
+        pos_logits = pos_logits.permute(0,2,1)
+        pos_logits = pos_logits.repeat([1,k_neg,1]).contiguous()
         neg_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
         loss = -torch.log(1/(1 + torch.exp(neg_logits-pos_logits))) # negative sampling
         return pos_logits, neg_logits, loss
@@ -108,21 +128,12 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
             targets: bs x seq_len
             neg_targets: bs x k_neg x seq_len
         """
-        pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)).squeeze(-1) 
-        # pos_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
-        # neg_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1)
-        mu = []
-        neg_logits = []
-        
-        for neg_i in range(k_neg):
-            neg_logits_i = logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  # bs x seq_len
-            mu.append(torch.exp(neg_logits_i-pos_logits))
-            neg_logits.append(neg_logits_i)
-        neg_logits = torch.stack(neg_logits, dim = 1)
-        # max_neg_logits = torch.max(neg_logits, dim =1).values # hardest 
-        
-        mu = torch.stack(mu, dim = 1) # bs x k_neg x seq_len 
-        # mu = torch.exp(neg_logits-pos_logits)
+        # pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)).squeeze(-1) 
+        pos_logits = logits.gather(dim=-1,index=targets.unsqueeze(-1)) # bs x seq_len x 1
+        pos_logits = pos_logits.permute(0,2,1)# bs x 1 x seq_len
+        pos_logits = pos_logits.repeat([1,k_neg,1]).contiguous()
+        neg_logits = torch.stack([ logits.gather(dim=-1,index=torch.unsqueeze(neg_targets[:,neg_i, :], -1)).squeeze(-1)  for neg_i in range(k_neg)], dim = 1).contiguous()
+        mu = torch.exp(neg_logits - pos_logits)
         loss = -torch.log(1/(1 + mu.sum(dim=1, keepdim=True))) # 1 - 1/(1 + sum(e^{neg_i-pos}))
         loss = loss.squeeze(1) # squeeze k_neg dimension
         return pos_logits, neg_logits, loss
@@ -191,29 +202,24 @@ def nll_loss(targets, neg_targets, logits, ignore_index=None, reduce=True,
         loss = mask(loss, pad_mask)
     else:
         loss = loss.squeeze(-1)
-        
-    
-    nce_log = {
-        
-    }
-    
-    
+
+
+    nce_log = {}
+
+
     if reduce:
-        # loss = loss.sum()
         loss = loss.sum()
-    
+
     check_classification_acc = True
     if check_classification_acc:
         max_neg_logits = torch.max(neg_logits, dim =1).values # hardest
+        org_pos_logits= logits.gather(dim=-1,index=org_targets.unsqueeze(-1)).squeeze(-1)
         if sample_version == 1:
-            num_correct_classification = torch.sum((pos_logits > max_neg_logits).masked_fill_(pad_mask, False))
+            num_correct_classification = torch.sum((org_pos_logits > max_neg_logits).masked_fill_(pad_mask, False))
             num_tokens = torch.numel(org_targets) - torch.sum(pad_mask)
         else:
-            num_correct_classification = torch.sum( (pos_logits > max_neg_logits).masked_fill_(pad_mask, False))
+            num_correct_classification = torch.sum( (org_pos_logits > max_neg_logits).masked_fill_(pad_mask, False))
             num_tokens = torch.numel(org_targets) - torch.sum(pad_mask) # exclude padding
-        # import pdb; pdb.set_trace()
-        # print(' check max_neg_logits')
-        print(" prediction acc: ", (num_correct_classification/num_tokens).item(), "loss: ", loss.item())
         nce_log["class_acc"] = (num_correct_classification/num_tokens).item()
     return loss, nce_log
 
@@ -293,15 +299,15 @@ def batch_sampling(target_batch, vocab_size, k_neg=1, validate_sampling=True):
     # fill col of sample ids and excluding pos token ids
 
     num_diff_tokens = len(pos_token_ids_set)
-    weights = torch.empty(vocab_size).fill_(
-        1/(vocab_size - num_diff_tokens)
-    )
-    for pos_token_id in flattened_targets.tolist():
-        weights[pos_token_id] = 0
-    batch_device = target_batch.device
-    bs, max_seq_len = target_batch.shape
+    with torch.no_grad():
+        weights = torch.empty(vocab_size).fill_(
+            1/(vocab_size - num_diff_tokens)
+        ).to("cuda")
 
-    sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=True).reshape(bs, k_neg, max_seq_len).to(batch_device)
+        weights[flattened_targets.tolist()] = 0
+        batch_device = target_batch.device
+        bs, max_seq_len = target_batch.shape
+        sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=True).reshape(bs, k_neg, max_seq_len)
     if validate_sampling:
         validate_samples(sampled_neg_targets, target_batch)
     return sampled_neg_targets
@@ -359,22 +365,15 @@ def batch_sampling_v4(target_batch, vocab_size, k_neg=1, validate_sampling=True)
         _type_: _description_
     """
     batch_device = target_batch.device
-    bs, max_seq_len = target_batch.shape
     def sample_random_tensor(l, h, shape):
         return torch.randint(low=l, high=h, size=shape)
-    
     sampled_neg_targets = []
     for _ in range(k_neg):
         rand_additive = sample_random_tensor(1, vocab_size-1, target_batch.shape).to(batch_device)
         snt = torch.remainder((target_batch + rand_additive), vocab_size)
         sampled_neg_targets.append(snt)
-        validate_samples(snt, target_batch)
+        # validate_samples(snt, target_batch)
     sampled_neg_targets = torch.stack(sampled_neg_targets, dim=1)
-    # sampled_neg_targets = sampled_neg_targets.reshape(bs, k_neg* max_seq_len)
-    # sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=True).reshape(bs, k_neg* max_seq_len).to(batch_device)
-    # import pdb; pdb.set_trace()
-    # print('check sampling weights')
-    
     return sampled_neg_targets
 
 
@@ -394,19 +393,21 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         3) logging outputs to display while training
         """
         # control hyperparameters here instead of command line
-        loss_version = 2
-        k_neg = 60
+        loss_version = 1
+        k_neg = 500
         sample_version = 1
         net_output = model(**sample["net_input"])
         loss, _, nce_log= self.compute_loss(model, net_output, sample,
                             reduce=reduce,
                             loss_version=loss_version,
-                            sample_version = sample_version,
+                            sample_version=sample_version,
                             k_neg =k_neg)
         ce_loss = self.compute_ce_loss(model, net_output, sample, reduce=True)
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
+        # TODO
+        # move loss version, sample version into 
         logging_output = {
             "loss": loss.data,
             "ntokens": sample["ntokens"],
@@ -415,9 +416,10 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
             "k_neg":k_neg,
             "loss_version": loss_version,
             "sample_version": sample_version,
-            "class_acc": nce_log["class_acc"],
             "ce_loss": ce_loss,
         }
+        if "class_acc" in nce_log:
+            logging_output["class_acc"] = nce_log["class_acc"] 
         return loss, sample_size, logging_output
 
     def compute_ce_loss(self, model, net_output, sample, reduce=True):
@@ -432,11 +434,8 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 ignore_index=self.padding_idx,
                 reduction="sum" if reduce else "none",
             )
-        compare_to_ce = False
-        if compare_to_ce:
-            print("CE Loss: ", loss)
         model.train()
-        
+        return loss
 
 
     def compute_loss(self, model, net_output, sample,
@@ -448,11 +447,8 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         targets = sample['target']
         logits = net_output[0]
         bs, max_seq_len, vocab_size = logits.shape
-        k_neg = 1000
         if sample_version == 1:
             neg_targets = batch_sampling(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
-            # neg_targets = neg_targets.unsqueeze(0)
-            # targets = targets.unsqueeze(0)
             loss, nce_log = nll_loss(
                 targets,
                 neg_targets,
@@ -460,11 +456,15 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 ignore_index=self.padding_idx,
                 reduce=reduce,
                 org_targets = targets,
-                sample_version = sample_version
+                sample_version = sample_version,
+                loss_version = loss_version,
             )
         elif sample_version == 2:
+            
+            
             dup_targets, neg_targets = batch_sampling_v2(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
-
+            
+            
             # logits = logits.unsqueeze(1).repeat_interleave(k_neg, dim=1) # TODO: it takes much more memory as k_neg grows 
             # logits = logits.repeat_interleave(k_neg, dim=0)
             loss, nce_log = nll_loss(
@@ -475,7 +475,8 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 ignore_index=self.padding_idx,
                 reduce=reduce,
                 org_targets = targets,
-                sample_version = sample_version
+                sample_version = sample_version,
+                loss_version = loss_version,
             )
         elif sample_version == 3:
             neg_targets = batch_sampling_v3(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
@@ -488,7 +489,8 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 ignore_index=self.padding_idx,
                 reduce=reduce,
                 org_targets = targets,
-                sample_version = sample_version
+                sample_version = sample_version,
+                loss_version = loss_version,
             )
         elif sample_version == 4:
             neg_targets = batch_sampling_v4(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
@@ -501,7 +503,8 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 ignore_index=self.padding_idx,
                 reduce=reduce,
                 org_targets = targets,
-                sample_version = sample_version
+                sample_version = sample_version,
+                loss_version = loss_version,
             )
             
         elif sample_version == 5:
@@ -514,7 +517,8 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
                 ignore_index=self.padding_idx,
                 reduce=reduce,
                 org_targets = targets,
-                verssample_versionion = sample_version
+                verssample_versionion = sample_version,
+                loss_version = loss_version,
             )
 
         # lprobs = model.get_normalized_probs(net_output, log_probs=True)
@@ -537,10 +541,15 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         loss_sum = sum(log.get("loss", 0) for log in logging_outputs)
         ntokens = sum(log.get("ntokens", 0) for log in logging_outputs)
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
-
+        pred_acc = sum(log.get("class_acc", 0) for log in logging_outputs) / len(logging_outputs)
+        ce_loss_sum = sum(log.get("ce_loss", 0) for log in logging_outputs)
+        metrics.log_scalar("class_acc", pred_acc, sample_size, round=3)
         # we divide by log(2) to convert the loss from base e to base 2
         metrics.log_scalar(
             "loss", loss_sum / sample_size / math.log(2), sample_size, round=3
+        )
+        metrics.log_scalar(
+            "ce_loss", ce_loss_sum / sample_size / math.log(2), sample_size, round=3
         )
         if sample_size != ntokens:
             metrics.log_scalar(
