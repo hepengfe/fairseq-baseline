@@ -16,38 +16,26 @@ BPEROOT=subword-nmt/subword_nmt
 BPE_TOKENS=32000
 
 URLS=(
-    "http://statmt.org/wmt13/training-parallel-europarl-v7.tgz" # https://www.statmt.org/wmt13/training-parallel-europarl-v7.tgz
-    "http://statmt.org/wmt13/training-parallel-commoncrawl.tgz" # https://www.statmt.org/wmt13/training-parallel-commoncrawl.tgz
-    "http://data.statmt.org/wmt17/translation-task/training-parallel-nc-v12.tgz"
-    # https://data.statmt.org/wmt16/translation-task/training-parallel-nc-v11.tgz
-    "http://data.statmt.org/wmt17/translation-task/dev.tgz"
-    # https://data.statmt.org/wmt16/translation-task/dev.tgz
-    "http://statmt.org/wmt14/test-full.tgz"
-    # https://data.statmt.org/wmt16/translation-task/test.tgz
+    "http://statmt.org/wmt13/training-parallel-europarl-v7.tgz"
+    "http://statmt.org/wmt13/training-parallel-commoncrawl.tgz" # 
+    "http://data.statmt.org/wmt16/translation-task/training-parallel-nc-v11.tgz"
+    "http://data.statmt.org/wmt16/translation-task/dev.tgz"
+    "https://data.statmt.org/wmt16/translation-task/test.tgz"
 )
-FILES=(
+FILES=(            
     "training-parallel-europarl-v7.tgz"
     "training-parallel-commoncrawl.tgz"
-    "training-parallel-nc-v12.tgz"
+    "training-parallel-nc-v11.tgz"
     "dev.tgz"
-    "test-full.tgz"
+    "test.tgz"
 )
 CORPORA=(
     "training/europarl-v7.de-en"
     "commoncrawl.de-en"
-    "training/news-commentary-v12.de-en" 
+    "training/news-commentary-v11.de-en"
 )
 
-# This will make the dataset compatible to the one used in "Convolutional Sequence to Sequence Learning"
-# https://arxiv.org/abs/1705.03122
-if [ "$1" == "--icml17" ]; then
-    URLS[2]="http://statmt.org/wmt14/training-parallel-nc-v9.tgz"
-    FILES[2]="training-parallel-nc-v9.tgz" 
-    CORPORA[2]="training/news-commentary-v9.de-en"
-    OUTDIR=wmt14_en_de
-else
-    OUTDIR=wmt17_en_de
-fi
+OUTDIR=wmt16_en_de
 
 if [ ! -d "$SCRIPTS" ]; then
     echo "Please set SCRIPTS variable correctly to point to Moses scripts."
@@ -95,7 +83,7 @@ for l in $src $tgt; do
         cat $orig/$f.$l | \
             perl $NORM_PUNC $l | \
             perl $REM_NON_PRINT_CHAR | \
-            perl $TOKENIZER -threads 8 -a -l $l >> $tmp/train.tags.$lang.tok.$l
+            perl $TOKENIZER -threads 32 -a -l $l >> $tmp/train.tags.$lang.tok.$l
     done
 done
 
@@ -106,11 +94,11 @@ for l in $src $tgt; do
     else
         t="ref"
     fi
-    grep '<seg id' $orig/test-full/newstest2014-deen-$t.$l.sgm | \
+    grep '<seg id' $orig/test/newstest2016-ende-$t.$l.sgm | \
         sed -e 's/<seg id="[0-9]*">\s*//g' | \
         sed -e 's/\s*<\/seg>\s*//g' | \
         sed -e "s/\’/\'/g" | \
-    perl $TOKENIZER -threads 8 -a -l $l > $tmp/test.$l
+    perl $TOKENIZER -threads 32 -a -l $l > $tmp/test.$l
     echo ""
 done
 
@@ -120,7 +108,7 @@ for l in $src $tgt; do
     awk '{if (NR%100 != 0)  print $0; }' $tmp/train.tags.$lang.tok.$l > $tmp/train.$l
 done
 
-TRAIN=$tmp/train.de-en
+TRAIN=$tmp/train.en-de
 BPE_CODE=$prep/code
 rm -f $TRAIN
 for l in $src $tgt; do
@@ -128,7 +116,7 @@ for l in $src $tgt; do
 done
 
 echo "learn_bpe.py on ${TRAIN}..."
-python $BPEROOT/learn_bpe.py -s $BPE_TOKENS < $TRAIN > $BPE_CODE
+python $BPEROOT/learn_bpe.py --num-workers 32 -s $BPE_TOKENS < $TRAIN > $BPE_CODE
 
 for L in $src $tgt; do
     for f in train.$L valid.$L test.$L; do
@@ -137,8 +125,8 @@ for L in $src $tgt; do
     done
 done
 
-perl $CLEAN -ratio 1.5 $tmp/bpe.train $src $tgt $prep/train 1 250
-perl $CLEAN -ratio 1.5 $tmp/bpe.valid $src $tgt $prep/valid 1 250
+perl $CLEAN -ignore_ratio $tmp/bpe.train $src $tgt $prep/train 1 1000
+perl $CLEAN -ignore_ratio $tmp/bpe.valid $src $tgt $prep/valid 1 1000
 
 for L in $src $tgt; do
     cp $tmp/bpe.test.$L $prep/test.$L

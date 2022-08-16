@@ -133,7 +133,6 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             if embed_dim != self.output_embed_dim and not cfg.tie_adaptive_weights
             else None
         )
-
         self.adaptive_softmax = None
         self.output_projection = output_projection
         if self.output_projection is None:
@@ -222,10 +221,15 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
         )
+        # x: bs x seqlen x dim
+        # extra: dictionary 
+        #     key: [attention, inner_states]
+        #     inner_states: list of layers' states.   shape: seq_len x bs x dim
+        # 
 
         if not features_only:
-            x = self.output_layer(x)
-        return x, extra
+            x = self.output_layer(x) # bs x seqlen x hidden_dim -> bs x seqlen x vocab
+        return x, extra, self.output_projection.weight
 
     def extract_features(
         self,

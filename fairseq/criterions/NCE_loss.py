@@ -106,7 +106,7 @@ def nll_loss(pos_logits, neg_logits, logits, ignore_index=None, reduce=True,
 
     
 
-    debug_training_sped = False
+    debug_training_sped = True
     if debug_training_sped:
         ignore_index = None
     if ignore_index is not None:
@@ -207,6 +207,22 @@ def batch_sampling_v2(target_batch, vocab_size, k_neg=1, validate_sampling=True)
     return new_target_batch, neg_target_batch
 
 
+def batch_sampling_hard_neg(target_batch, logits, k_neg=1, validate_sampling=True):
+    """
+    Based on model logits for all vocabulary terms, pointwise add up logits for
+    all of token logits. Use them as the weights to sample negative samples.
+    """
+    flattened_targets = torch.flatten(target_batch)
+    dim = len(logits.shape)
+    weights = logits.sum(dim=range(dim-1)) # sum along the last dimension
+    weights.index_fill_(0, flattened_targets, 0)
+    bs, max_seq_len = target_batch.shape
+    replacement = True
+    sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=replacement).reshape(bs, k_neg, max_seq_len)
+    return sampled_neg_targets
+    
+
+
 def batch_sampling(target_batch, vocab_size, k_neg=1, validate_sampling=True):
     """
     sampling net targets for the whole tgt length
@@ -229,7 +245,7 @@ def batch_sampling(target_batch, vocab_size, k_neg=1, validate_sampling=True):
         bs, max_seq_len = target_batch.shape
         replacement = True
         sampled_neg_targets = torch.multinomial(weights, bs*k_neg*max_seq_len, replacement=replacement).reshape(bs, k_neg, max_seq_len)
-        
+
     if validate_sampling:
         validate_samples(sampled_neg_targets, target_batch)
     return sampled_neg_targets
@@ -305,7 +321,7 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.loss_version = 2
-        self.k_neg = 150 # vocab size 35664
+        self.k_neg = 200 # vocab size 35664
         self.sample_version = 1
         self.projection_layer = torch.nn.Linear(512, self.k_neg + 1)
 
@@ -321,12 +337,19 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         # control hyperparameters here instead of command line
         
         net_output = model(**sample["net_input"], features_only=True)
+        torch.cuda.empty_cache() 
+        # import pdb; pdb.set_trace()
+        # print('before nce')  # 3.6, 4.5, 8.1
         loss, _, nce_log= self.compute_loss(model, net_output, sample,
                             reduce=reduce,
                             loss_version=self.loss_version,
                             sample_version=self.sample_version,
                             k_neg = self.k_neg)
-        torch.cuda.empty_cache()
+        # import pdb; pdb.set_trace()
+        # print('after nce') # 5.6,  6.4, 8.1
+        torch.cuda.empty_cache() # 4.6, 5.4, 5.3
+        
+        
         ce_loss = self.compute_ce_loss(model, net_output, sample, reduce=True)
         # ce_loss = 0
         sample_size = (
@@ -335,7 +358,7 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
         # TODO
         # move loss version, sample version into 
         logging_output = {
-            "loss": loss.data,
+            "loss": loss,
             "ntokens": sample["ntokens"],
             "nsentences": sample["target"].size(0),
             "sample_size": sample_size,
@@ -388,18 +411,26 @@ class NoiseContrastiveEstimationCriterion(FairseqCriterion):
             neg_targets = batch_sampling(target_batch=targets, vocab_size=vocab_size, k_neg=k_neg)
             target_shape = targets.shape
             neg_targets_shape = neg_targets.shape
-            pos_hidden2emb = vocab2hidden.index_select(0, targets.flatten()).reshape(*target_shape, hidden_size)
 
-            neg_hidden2emb = vocab2hidden.index_select(0, neg_targets.flatten()).reshape(*neg_targets_shape, hidden_size)
+            
+            pos_hidden2emb = F.embedding(targets, vocab2hidden)
+            # pos_hidden2emb = vocab2hidden.index_select(0, targets.flatten()).reshape(*target_shape, hidden_size)
+
+            neg_hidden2emb = F.embedding(neg_targets, vocab2hidden)
+            # neg_hidden2emb = vocab2hidden.index_select(0, neg_targets.flatten()).reshape(*neg_targets_shape, hidden_size)
             empty_cache = False
+            # import pdb; pdb.set_trace()
+            # print('dd')
+
             pos_logits = torch.sum(logits * pos_hidden2emb, -1) # 0.3G
 
             if empty_cache:
                 torch.cuda.empty_cache()
 
             # NOTE: in-place broadcast
-            logits, neg_hidden2emb = torch.broadcast_tensors(logits.unsqueeze(1), neg_hidden2emb)
-            neg_logits = torch.sum(logits * neg_hidden2emb, -1) # 0.5G
+            # logits, neg_hidden2emb = torch.broadcast_tensors(logits.unsqueeze(1), neg_hidden2emb)
+            # neg_logits = torch.sum(logits * neg_hidden2emb, -1) # 0.5G
+            neg_logits = torch.sum(logits.unsqueeze(1) * neg_hidden2emb, -1) # 1G
             if empty_cache:
                 torch.cuda.empty_cache()
             loss, nce_log = nll_loss(
